@@ -40,9 +40,9 @@ def powerDownSensors():
 def selectSeeLevel(sensorNum):
     # pulse the bus "n" times to address sensor #n (n=0, 1, 2, ...)
     for i in range(sensorNum+1):
-        SeeLevelSelectPin.on()
-        time.sleep(85*ONE_MICROSECOND)
         SeeLevelSelectPin.off()
+        time.sleep(85*ONE_MICROSECOND)
+        SeeLevelSelectPin.on()
         time.sleep(215*ONE_MICROSECOND)
 
     return
@@ -59,6 +59,7 @@ def PulsesIn(num_pulses):
         pulse_widths.append(width)
     return pulse_widths
 
+# collect the 12-byte sequence returned by the sensor
 def readSeeLevelBytes():
     num_pulses = 8*NUM_RESPONSE_BYTES
     # first, collect all of the pulses in the sensor response
@@ -66,7 +67,7 @@ def readSeeLevelBytes():
     #pulses = pulseio.PulseIn(SeeLevelResponsePin, num_pulses, True)
     #time.sleep(23*ONE_MILLISECOND)
     #while (len(pulses) != num_pulses): pass
-    pulses = PulsesIn(8*NUM_RESPONSE_BYTES)
+    pulses = PulsesIn(num_pulses)
 
     byte_data = []
     # convert pulse widths into data bytes
