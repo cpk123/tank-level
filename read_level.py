@@ -10,6 +10,7 @@ NUM_RESPONSE_BYTES = const(12)     # SeeLevel sensor returns 12 bytes when probe
 # define GPIO pins used on Pico
 SeeLevelSelectGPIO = 0
 SeeLevelResponseGPIO = 1
+SLDataTriggerGPIO = 2       # used to trigger o-scope for response data
 
 # error counts
 checksum_errs = 0
@@ -29,47 +30,52 @@ SeeLevelSelectPin.off()
 def powerUpSensors():
     # raise power on the SeeLevel bus
     SeeLevelSelectPin.on()
-    utime.sleep_ms(2.5)      # wait until sensors power up
+    utime.sleep_ms(2)      # wait until sensors power up
 
 def powerDownSensors():
     # lower power on the SeeLevel bus
-    utime.sleep_ms(100)
+    utime.sleep_ms(1)
     SeeLevelSelectPin.off()
 
 def selectSeeLevel(sensorNum):
     # pulse the bus "n" times to address sensor #n (n=0, 1, 2, ...)
-    for i in range(sensorNum+1):
+    for dummy in range(sensorNum+1):
         SeeLevelSelectPin.off()
-        utime.sleep_us(85)
+        utime.sleep_us(75)          # adjust to show 85 us pulse on oscilloscope
         SeeLevelSelectPin.on()
         utime.sleep_us(215)
-    utime.sleep_ms(6)       # give sensor time to take a measurement
+    p = Pin(SLDataTriggerGPIO,Pin.OUT)
+    p.off()
+    utime.sleep_ms(9)
+    p.on()                  # trigger pulse to see sensor data on oscilloscope
+    utime.sleep_ms(1)
+    p.off()
     return
 
 # my version of the pulseio.PulseIn method from CircuitPython
 def PulsesIn(num_pulses):
-    pulse_widths = []
+    pulse_widths = bytearray(num_pulses)
     value_method = SeeLevelResponsePin.value    # cache method calls to improve timing accuracy
     time_us = utime.ticks_us
     diff_us = utime.ticks_diff
 
     def time_out():
-        # fail if we dont see any pulse activity
-        return diff_us(time_us(),start) > 5000
+        # fail if we dont see any pulse activity within 10 milliseconds
+        return  diff_us(time_us(),start) > 10000
 
     for i in range(num_pulses):
-        start = time_us()
         while value_method():           # wait for next pulse
-            if time_out(): return pulse_widths
+            #if time_out(): return pulse_widths
+            pass
 
         start = time_us()
         while not value_method():       # measure negative pulse width
-            if time_out(): return pulse_widths
+            #if time_out(): return pulse_widths
+            pass
         end = time_us()
 
-        width = diff_us(end,start)
-
-        pulse_widths.append(width)
+        #pulse_widths.append(diff_us(end,start))
+        pulse_widths[i] = diff_us(end,start)
     return pulse_widths
 
 # collect the 12-byte sequence returned by the sensor
@@ -83,52 +89,51 @@ def readSeeLevelBytes():
     pulses = PulsesIn(num_pulses)
 
     byte_data = []
-    if len(pulses == num_pulses):   # if sensor responded
+    print("collected "+str(len(pulses))+" pulses")
+    print(pulses)
+    if len(pulses) == num_pulses:   # if sensor responded
         # convert pulse widths into data bytes
-        for byte_index in range(NUM_RESPONSE_BYTES,8):
+        for byte_index in range(0,NUM_RESPONSE_BYTES*8,8):
             cur_byte_pulses = pulses[byte_index:byte_index+8]   # select pulses for next byte
             # bits were sent Big-Endian, so reverse them to simplify following bit-shifts
-            cur_byte_pulses.reverse()
+            #cur_byte_pulses.reverse()
             # any pulse less than 26 microseconds is a logical "1", and "0" if greater
-            sl_byte = sum([int(pw < 26) << i for i, pw in enumerate(cur_byte_pulses)])
+            sl_byte = sum([int(pw > 26) << 7-i for i, pw in enumerate(cur_byte_pulses)])
             byte_data.append(sl_byte)
+            print(hex(sl_byte))
     #pulses.clear()     # uncomment for CircuitPython
     return bytes(byte_data)
 
 # decodeTankLevel returns percentage of tank filled
 def decodeTankLevel(sensorData, calibrationData):
-    print("sensor data: " + sensorData)
+    print("sensor data: " + str(sensorData))
     tankLevel = 0
-
-    # determine number of segments used by sensor
-    base_seg = len(sensorData)-1
-    # sensor returns zero for unavailable segments
-    while base_seg > 0 :
-        if sensorData[base_seg] == 0:
-            base_seg -= 1
-        else:
-            break
+    len_sd = len(sensorData)
 
     # get first non-empty segment
     level_seg = 0
-    while level_seg < len(sensorData) :
+    while level_seg < len_sd:
         if sensorData[level_seg] == 0:
             level_seg += 1
         else:
             break
-    if level_seg == len(sensorData):
+    if level_seg == len_sd:
         return 0    # all segments are zero, so tank is empty
 
     if calibrationData == []:
         # calibration data is not available, so guestimate tank level
         # assuming tank is a rectangular solid.
         # compute differential percentage of tank represented by each segment
-        avg_contribution_per_segment = 100.0/(base_seg+1)
+        print("len="+str(len_sd))
+        avg_contribution_per_segment = 100.0/len_sd
         # in case segment maximums dont max out (ie, reach 255),
         # average the filled segments to better estimate contribution
         # from the segment spanning current water level.
-        avg_reading_per_seg = sum(sensorData[level_seg+1:])/(base_seg+1)
-        tankLevel = (sensorData[level_seg]/avg_reading_per_seg + (base_seg-level_seg))*avg_contribution_per_segment
+        if level_seg < len_sd-1:
+            avg_reading_per_seg = sum(sensorData[level_seg+1:])/len_sd
+        else:
+            avg_reading_per_seg = 255
+        tankLevel = (sensorData[level_seg]/avg_reading_per_seg + (len_sd-1-level_seg))*avg_contribution_per_segment
         if tankLevel > 100: tankLevel = 100
     else:
         tankLevel = -1      # TBD
@@ -155,17 +160,35 @@ def readTankLevel(sensorID):
         print("*** invalid stream preamble!")
         preamble_errs += 1
     else:
-        byte_checksum = sum(slbytes[2:])
-        if (byte_checksum - (2+slbytes[1]) % 256) != 0:
-            print("***checksum error!")
+        # determine number of segments used by sensor
+        base_seg = len(slbytes)-1
+        # sensor returns 0xFF for unavailable segments
+        while base_seg > 0 :
+            if slbytes[base_seg] == 0xFF:
+                base_seg -= 1
+            else:
+                break
+        byte_checksum = (sum(slbytes[2:base_seg+1]) - 2) % 256
+        if byte_checksum - slbytes[1] != 0:
+            print(byte_checksum)
+            print("***checksum error!"+str(slbytes[1]))
             checksum_errs += 1
         else:
             # convert data bytes to a tank level
-            tankLevel = decodeTankLevel(slbytes[2:], SensorCal[sensorID])
+            tankLevel = decodeTankLevel(slbytes[2:base_seg+1], SensorCal[sensorID])
 
     return tankLevel
 
-powerUpSensors()
-tank1_level = readTankLevel(0)     # read level from first sensor
+loops = 1
+while loops > 0:
+    loops -= 1
+    powerUpSensors()
+    tank1_level = readTankLevel(0)     # read level from first sensor
+    #utime.sleep_ms(10)ow
+    #readTankLevel(1)
+    #utime.sleep_ms(10)
+    #selectSeeLevel(0)
+    powerDownSensors()
+    #utime.sleep_ms(100)
 print("test tank level is " + str(tank1_level) +"%")
-powerDownSensors()
+#powerDownSensors()
